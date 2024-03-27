@@ -11,7 +11,7 @@ local function open_buf_with_float_win(bufnr, title, opts)
         row = (vim.o.lines - h - 1) * 0.5,
         col = (vim.o.columns - w) * 0.5,
         border = "rounded",
-        footer = "Press q to exit",
+        footer = ":set ma(!) :set wrap(!) | press q to exit",
         footer_pos = "right",
         style = opts.style,
     })
