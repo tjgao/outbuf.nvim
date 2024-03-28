@@ -1,4 +1,5 @@
-local last_command = nil
+local A = require("plenary.async")
+local J = require("plenary.job")
 
 local function open_buf_with_float_win(bufnr, title, opts)
     local w = math.max(math.min(opts.width, vim.o.columns - 20), 20)
@@ -38,40 +39,94 @@ local function make_quitable(bufnr)
     vim.api.nvim_buf_set_keymap(bufnr, "n", "q", "<cmd>quit<CR>", {})
 end
 
-local function move_to_end(win, lines)
-    vim.api.nvim_win_set_cursor(win, { #lines, 0 })
+local function shorten_string(str, len)
+    if string.len(str) > len then
+        return string.sub(str, 1, len - 3) .. "..."
+    end
+    return str
 end
 
-local function show_info(output, title, opts)
+local function create_task_popup(opts, states)
     local bufnr = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_buf_set_text(bufnr, 0, 0, 0, 0, output)
     opts.width = opts.width or math.floor(vim.o.columns * 0.618)
     opts.height = opts.height or math.floor(vim.o.lines * 0.618)
-    local win = open_buf_with_float_win(bufnr, title, opts)
-    vim.api.nvim_set_option_value("wrap", (opts.wrap and true) or false, { win = win })
-    vim.api.nvim_set_option_value("modifiable", (opts.modifiable and true) or false, { buf = bufnr })
-    move_to_end(win, output)
-    make_quitable(bufnr)
+    vim.api.nvim_buf_set_var(bufnr, "local_task_states", states)
+    local show_cmd = "Output from: " .. shorten_string(states.cmd, 33)
+    local win = open_buf_with_float_win(bufnr, show_cmd, opts)
+    states["win"], states["bufnr"] = win, bufnr
+    return win, bufnr
 end
 
-local function retrieve_results(opts, ...)
+local function launch_sync(opts, states)
+    local obj = vim.api.nvim_exec2(states.cmd, { output = true })
+    if not obj.output or obj.output == "" then
+        print("No output for this command")
+        return
+    end
+    local output = vim.split(obj.output, "\n")
+    if opts.merge_spaces == true then
+        output = merge_spaces(output)
+    end
+    local win, bufnr = create_task_popup(opts, states)
+    vim.api.nvim_buf_set_text(bufnr, 0, 0, 0, 0, output)
+    vim.api.nvim_buf_set_lines(bufnr, -1, -1, true, output)
+    vim.api.nvim_win_set_cursor(win, { #output, 0 })
+    vim.api.nvim_set_option_value("wrap", (opts.wrap and true) or false, { win = win })
+    vim.api.nvim_set_option_value("modifiable", (opts.modifiable and true) or false, { buf = bufnr })
+    make_quitable(bufnr)
+    states["running"] = false
+end
+
+local function launch_async(opts, states)
+    local win, bufnr = create_task_popup(opts, states)
+    vim.api.nvim_set_option_value("wrap", (opts.wrap and true) or false, { win = win })
+    -- vim.api.nvim_set_option_value("modifiable", (opts.modifiable and true) or false, { buf = bufnr })
+
+    local function start_job()
+        local job = J:new({
+            command = states.cmd,
+            args = states.args,
+            on_stdout = function(err, line, j)
+                vim.schedule(function()
+                    vim.api.nvim_buf_set_lines(states.bufnr, -1, -1, true, { line })
+                    vim.cmd("norm G 0")
+                end)
+            end,
+            on_exit = function(j, _)
+                states["running"] = false
+            end,
+        })
+
+        job:start()
+    end
+
+    A.void(start_job)("")
+end
+
+local function launch(opts, ...)
     local varg = { ... }
-    local cmd = table.concat(varg, " ")
-    local obj = vim.api.nvim_exec2(cmd, { output = true })
-    if obj.output ~= "" then
-        local output = vim.split(obj.output, "\n")
-        if opts.merge_spaces == true then
-            output = merge_spaces(output)
-        end
-        local cmd_show = cmd
-        if string.len(cmd) > 33 then
-            cmd_show = string.sub(cmd, 1, 30) .. "..."
-        end
-        show_info(output, "Output from: " .. cmd_show, opts)
+    if #varg < 1 then
+        return
+    end
+
+    local task_states = {}
+    if string.sub(varg[1], 1, 1) == "!" then
+        -- external commands, we do it in the async way
+        task_states["mode"] = "async"
+        task_states["cmd"] = string.sub(varg[1], 2)
+        table.remove(varg, 1)
+        task_states["args"] = varg
+        launch_async(opts, task_states)
+    else
+        -- internal commands
+        task_states["mode"] = "sync"
+        task_states["cmd"] = table.concat(varg, " ")
+        launch_sync(opts, task_states)
     end
 end
 
 -- used for debug
+---@diagnostic disable-next-line: unused-function
 local function reload()
     if package.loaded.outbuf then
         package.loaded["outbuf"] = nil
@@ -95,17 +150,20 @@ end
 -- merge_spaces, merge multiple consective empty lines into one
 local function setup(cfg)
     cfg = cfg or {}
+    if cfg.move_to_end == nil then
+        cfg["move_to_end"] = true
+    end
     local cmd = cfg.cmd or "Ob"
     vim.api.nvim_create_user_command(cmd, function(opts)
-        if opts.bang and last_command then
-            retrieve_results(cfg, unpack(last_command))
+        if opts.bang then
+            -- TODO: show outbuf list
+            -- retrieve_results(cfg, unpack(last_command))
         else
             if not opts.args or string.len(opts.args) < 1 then
                 print("Usage: :" .. cmd .. " <command> <arg1>? <arg2>? ... or :" .. cmd .. "! to repeat last command")
                 return
             end
-            retrieve_results(cfg, unpack(opts.fargs))
-            last_command = opts.fargs
+            launch(cfg, unpack(opts.fargs))
         end
     end, {
         bang = true,
@@ -117,6 +175,6 @@ end
 
 return {
     -- used for debug
-    -- reload = reload,
+    reload = reload,
     setup = setup,
 }
